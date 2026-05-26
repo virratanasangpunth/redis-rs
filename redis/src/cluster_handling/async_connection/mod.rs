@@ -135,7 +135,7 @@ use futures_util::{
     sink::Sink,
     stream::{self, Stream, StreamExt},
 };
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 use rand::{rng, seq::IteratorRandom};
 use request::{CmdArg, PendingRequest, Request, RequestState, Retry};
 use routing::{InternalRoutingInfo, InternalSingleNodeRouting, route_for_pipeline};
@@ -879,8 +879,14 @@ where
     }
 
     async fn connect_check_and_add(&self, addr: &NodeAddress) -> RedisResult<C> {
+        info!("mr2-debug: connect_check_and_add start: addr={addr:?}");
+        let start = std::time::Instant::now();
         match connect_and_check::<C>(addr, &self.cluster_params).await {
             Ok(conn) => {
+                info!(
+                    "mr2-debug: connect_check_and_add ok: addr={addr:?} elapsed={:?}",
+                    start.elapsed()
+                );
                 self.conn_lock
                     .write()
                     .await
@@ -888,13 +894,25 @@ where
                     .insert(addr.clone(), conn.clone());
                 Ok(conn)
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                info!(
+                    "mr2-debug: connect_check_and_add FAILED: addr={addr:?} elapsed={:?} err={err:?}",
+                    start.elapsed()
+                );
+                Err(err)
+            }
         }
     }
 
     // Query a node to discover slot-> master mappings.
     async fn refresh_slots(self) -> RedisResult<()> {
+        info!("mr2-debug: refresh_slots start (waiting for write lock)");
+        let start = std::time::Instant::now();
         let mut write_guard = self.conn_lock.write().await;
+        info!(
+            "mr2-debug: refresh_slots acquired write lock after {:?}",
+            start.elapsed()
+        );
         let (connections, slots) = &mut *write_guard;
 
         let mut result = Ok(());
@@ -923,6 +941,10 @@ where
         let nodes = slots.values().flatten().cloned().collect::<HashSet<_>>();
         self.refresh_connections_locked(connections, nodes).await;
 
+        info!(
+            "mr2-debug: refresh_slots done (lock released) total_elapsed={:?}",
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -932,6 +954,11 @@ where
         nodes: HashSet<NodeAddress>,
     ) {
         let nodes_len = nodes.len();
+        info!(
+            "mr2-debug: refresh_connections_locked start: {nodes_len} nodes, addrs={:?}",
+            nodes
+        );
+        let start = std::time::Instant::now();
 
         let addresses_and_connections_iter = nodes
             .into_iter()
@@ -947,12 +974,26 @@ where
         stream::iter(addresses_and_connections_iter)
             .buffer_unordered(nodes_len.max(8))
             .fold(connections, |connections, (addr, result)| async move {
-                if let Ok(conn) = result {
-                    connections.insert(addr, conn);
+                match result {
+                    Ok(conn) => {
+                        info!(
+                            "mr2-debug: refresh_connections_locked reconnected: addr={addr:?}"
+                        );
+                        connections.insert(addr, conn);
+                    }
+                    Err(err) => {
+                        info!(
+                            "mr2-debug: refresh_connections_locked FAILED reconnect: addr={addr:?} err={err:?}"
+                        );
+                    }
                 }
                 connections
             })
             .await;
+        info!(
+            "mr2-debug: refresh_connections_locked done after {:?}",
+            start.elapsed()
+        );
     }
 
     fn resubscribe(&self) {
@@ -1164,11 +1205,23 @@ where
     ) -> impl Future<Output = ()> + use<C> {
         let inner = self.inner.clone();
         async move {
+            info!(
+                "mr2-debug: refresh_connections start (waiting for write lock): addrs={addrs:?}"
+            );
+            let start = std::time::Instant::now();
             let mut write_guard = inner.conn_lock.write().await;
+            info!(
+                "mr2-debug: refresh_connections acquired write lock after {:?}",
+                start.elapsed()
+            );
 
             inner
                 .refresh_connections_locked(&mut write_guard.0, addrs)
                 .await;
+            info!(
+                "mr2-debug: refresh_connections done (lock released) total_elapsed={:?}",
+                start.elapsed()
+            );
         }
     }
 
@@ -1421,16 +1474,23 @@ where
             match ready!(self.poll_complete(cx)) {
                 PollFlushAction::None => return Poll::Ready(Ok(())),
                 PollFlushAction::RebuildSlots => {
+                    info!("mr2-debug: poll_flush -> PollFlushAction::RebuildSlots");
                     self.state = ConnectionState::Recover(RecoverFuture::RecoverSlots(Box::pin(
                         self.inner.clone().refresh_slots(),
                     )));
                 }
                 PollFlushAction::Reconnect(addrs) => {
+                    info!(
+                        "mr2-debug: poll_flush -> PollFlushAction::Reconnect addrs={addrs:?}"
+                    );
                     self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
                         self.refresh_connections(addrs).map(Ok),
                     )));
                 }
                 PollFlushAction::ReconnectFromInitialConnections => {
+                    info!(
+                        "mr2-debug: poll_flush -> PollFlushAction::ReconnectFromInitialConnections"
+                    );
                     self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
                         self.reconnect_to_initial_nodes(),
                     )));

@@ -1206,20 +1206,24 @@ where
         let inner = self.inner.clone();
         async move {
             info!(
-                "mr2-debug: refresh_connections start (waiting for write lock): addrs={addrs:?}"
+                "mr2-debug: refresh_connections start (waiting for read lock): addrs={addrs:?}"
             );
             let start = std::time::Instant::now();
-            let mut write_guard = inner.conn_lock.write().await;
+            let mut connections = inner.conn_lock.read().await.0.clone();
             info!(
-                "mr2-debug: refresh_connections acquired write lock after {:?}",
+                "mr2-debug: refresh_connections read lock acquired after {:?}",
                 start.elapsed()
             );
 
-            inner
-                .refresh_connections_locked(&mut write_guard.0, addrs)
-                .await;
+            inner.refresh_connections_locked(&mut connections, addrs).await;
             info!(
-                "mr2-debug: refresh_connections done (lock released) total_elapsed={:?}",
+                "mr2-debug: refresh_connections refresh_connections_locked done after {:?}",
+                start.elapsed()
+            );
+
+            inner.conn_lock.write().await.0 = connections;
+            info!(
+                "mr2-debug: refresh_connections write lock released after {:?}",
                 start.elapsed()
             );
         }
@@ -1480,9 +1484,7 @@ where
                     )));
                 }
                 PollFlushAction::Reconnect(addrs) => {
-                    info!(
-                        "mr2-debug: poll_flush -> PollFlushAction::Reconnect addrs={addrs:?}"
-                    );
+                    info!("mr2-debug: poll_flush -> PollFlushAction::Reconnect addrs={addrs:?}");
                     self.state = ConnectionState::Recover(RecoverFuture::Reconnect(Box::pin(
                         self.refresh_connections(addrs).map(Ok),
                     )));

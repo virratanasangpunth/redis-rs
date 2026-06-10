@@ -1,0 +1,20 @@
+[package]
+name = "cluster-stall-repro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "cluster-stall-repro"
+path = "src/main.rs"
+
+[dependencies]
+redis = { path = "../redis", features = ["cluster-async", "tokio-comp", "tokio-rustls-comp", "tls-rustls-insecure"] }
+# redis builds rustls with default-features = false; a provider feature must be
+# enabled by the consumer or rustls panics at connect time
+rustls = { version = "0.23", features = ["ring"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+clap = { version = "4", features = ["derive"] }
+hdrhistogram = "7"
+env_logger = "0.11"
+log = "0.4"

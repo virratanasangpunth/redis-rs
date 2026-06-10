@@ -5,6 +5,7 @@ members = [
   "valkey",
   "afl/parser",
   "test-macros",
+  "cluster-stall-repro",
 ]
 resolver = "2"
 

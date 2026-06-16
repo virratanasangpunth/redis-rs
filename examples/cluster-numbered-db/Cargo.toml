@@ -1,0 +1,10 @@
+[package]
+name = "cluster-numbered-db-example"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+redis = { path = "../../redis", features = ["cluster-async", "tokio-comp"] }
+tokio = { workspace = true }

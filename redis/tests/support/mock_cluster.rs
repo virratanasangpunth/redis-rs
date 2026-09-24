@@ -24,10 +24,29 @@ type Handler = Arc<dyn Fn(&[u8], u16) -> Result<(), RedisResult<Value>> + Send +
 
 static HANDLERS: LazyLock<RwLock<HashMap<String, Handler>>> = LazyLock::new(Default::default);
 
+type Delay = Arc<dyn Fn(&[u8], u16) -> Duration + Send + Sync>;
+
+static DELAYS: LazyLock<RwLock<HashMap<String, Delay>>> = LazyLock::new(Default::default);
+
+/// Makes async mock connections for `id` wait `delay(cmd, port)` before replying.
+/// Pair with a paused tokio clock to control how requests interleave.
+#[cfg(feature = "cluster-async")]
+pub fn set_mock_delay(
+    id: &str,
+    delay: impl Fn(&[u8], u16) -> Duration + Send + Sync + 'static,
+) -> RemoveHandler {
+    DELAYS
+        .write()
+        .unwrap()
+        .insert(id.to_string(), Arc::new(delay));
+    RemoveHandler(vec![id.to_string()])
+}
+
 #[derive(Clone)]
 pub struct MockConnection {
     pub handler: Handler,
     pub port: u16,
+    pub id: String,
 }
 
 impl MockConnection {
@@ -66,6 +85,7 @@ impl cluster_async::Connect for MockConnection {
                 .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
                 .clone(),
             port,
+            id: name.clone(),
         }))
     }
 }
@@ -89,6 +109,7 @@ impl cluster::Connect for MockConnection {
                 .unwrap_or_else(|| panic!("Handler `{name}` were not installed"))
                 .clone(),
             port,
+            id: name.clone(),
         })
     }
 
@@ -227,7 +248,18 @@ pub fn broken_pipe_error() -> RedisError {
 #[cfg(feature = "cluster-async")]
 impl aio::ConnectionLike for MockConnection {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a redis::Cmd) -> RedisFuture<'a, Value> {
-        Box::pin(future::ready(self.execute_cmd(cmd)))
+        let delay = DELAYS
+            .read()
+            .unwrap()
+            .get(&self.id)
+            .map(|delay| delay(&cmd.get_packed_command(), self.port));
+        let result = self.execute_cmd(cmd);
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            result
+        })
     }
 
     fn req_packed_commands<'a>(
@@ -313,6 +345,7 @@ impl Drop for RemoveHandler {
     fn drop(&mut self) {
         for id in &self.0 {
             HANDLERS.write().unwrap().remove(id);
+            DELAYS.write().unwrap().remove(id);
         }
     }
 }

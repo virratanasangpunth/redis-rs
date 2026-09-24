@@ -1371,6 +1371,118 @@ mod cluster_async {
     }
 
     #[test]
+    fn test_async_cluster_refresh_does_not_deadlock_behind_parked_readers() {
+        // Regression test for https://github.com/redis-rs/redis-rs/issues/2418.
+        let name = "test_async_cluster_refresh_does_not_deadlock_behind_parked_readers";
+        let MockEnv {
+            async_connection: connection,
+            handler: _handler,
+            runtime,
+            ..
+        } = MockEnv::with_client_builder(
+            ClusterClient::builder(vec![&*format!("redis://{name}")]).retries(0),
+            name,
+            move |cmd: &[u8], _| {
+                // {foo} key hashes to node 6380
+                // {bar} key hashes to node 6379
+                respond_startup_two_nodes(name, cmd)?;
+                if contains_slice(cmd, b"{foo}lost") {
+                    return Err(Err(broken_pipe_error()));
+                }
+                if contains_slice(cmd, b"{bar}moved-first")
+                    || contains_slice(cmd, b"{bar}moved-second")
+                {
+                    return Err(parse_redis_value(
+                        format!("-MOVED 5061 {name}:6379\r\n").as_bytes(),
+                    ));
+                }
+                Err(Ok(Value::BulkString(b"value".to_vec())))
+            },
+        );
+        // The scenario is scripted with reply delays on a paused tokio clock, so the times below
+        // are virtual and the ordering is exact. L = `reconnect_loop` for 6380, F1/F2 = first and
+        // second slot refresh. All three spawned GETs are sent at t=0.
+        //
+        //   t=0    `{foo}lost` -> BrokenPipe. L starts and PINGs 6380, holding no lock.
+        //   t=20   `{bar}moved-first` -> MOVED. F1 takes `conn_lock` and sends CLUSTER SLOTS.
+        //   t=30   L's PING returns. L queues on `conn_lock` behind F1.
+        //   t=50   `{bar}during-refresh` is sent. It waits in the pending queue (no dispatch
+        //          during recovery).
+        //   t=70   CLUSTER SLOTS returns. F1 PINGs every node; 6380 takes PING_6380_MS.
+        //   t=80   `{bar}moved-second` -> MOVED. Not polled until F1 finishes.
+        //   t=100  F1 finishes and the lock is handed to L, which is not polled yet.
+        //          `during-refresh` is dispatched and queues behind L; moved-second starts F2.
+        //   next   L releases the lock. Without the fix, that hands a read permit to
+        //          `during-refresh`, which is never polled during F2, and F2 waits forever.
+        //
+        // Each step adds ~1ms of timer rounding, so F1 really finishes at ~103ms.
+        const MOVED_FIRST_MS: u64 = 20; // when F1 starts
+        const PING_6380_MS: u64 = 30; // L's PING, and F1's PING of 6380
+        const CLUSTER_SLOTS_MS: u64 = 50; // F1's CLUSTER SLOTS round trip
+        const SEND_DURING_REFRESH_MS: u64 = 50; // when `during-refresh` is sent
+        const MOVED_SECOND_MS: u64 = 80; // when F2's trigger arrives
+        const F1_END_MS: u64 = MOVED_FIRST_MS + CLUSTER_SLOTS_MS + PING_6380_MS;
+        // If a delay is changed so the sequence above no longer happens, fail the build rather
+        // than letting the test pass on buggy code.
+        const _: () = {
+            assert!(
+                PING_6380_MS > MOVED_FIRST_MS,
+                "L must still be on its PING when F1 takes the lock"
+            );
+            assert!(
+                PING_6380_MS < F1_END_MS,
+                "L must queue behind F1 before F1 releases the lock"
+            );
+            assert!(
+                MOVED_FIRST_MS < SEND_DURING_REFRESH_MS && SEND_DURING_REFRESH_MS < F1_END_MS,
+                "`during-refresh` must be sent while F1 holds the lock"
+            );
+            assert!(
+                MOVED_FIRST_MS < MOVED_SECOND_MS && MOVED_SECOND_MS < F1_END_MS,
+                "the second MOVED must arrive during F1, so F2 starts as soon as F1 finishes"
+            );
+        };
+        let _delay = set_mock_delay(name, |cmd, port| {
+            let ms = if contains_slice(cmd, b"PING") && port == 6380 {
+                PING_6380_MS
+            } else if contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS") {
+                CLUSTER_SLOTS_MS
+            } else if contains_slice(cmd, b"{bar}moved-first") {
+                MOVED_FIRST_MS
+            } else if contains_slice(cmd, b"{bar}moved-second") {
+                MOVED_SECOND_MS
+            } else {
+                0
+            };
+            Duration::from_millis(ms)
+        });
+
+        let result = runtime.block_on(async move {
+            tokio::time::pause();
+            let get = |key: &'static str| {
+                let mut connection = connection.clone();
+                async move {
+                    cmd("GET")
+                        .arg(key)
+                        .query_async::<String>(&mut connection)
+                        .await
+                }
+            };
+            tokio::spawn(get("{bar}moved-first"));
+            tokio::spawn(get("{bar}moved-second"));
+            tokio::spawn(get("{foo}lost"));
+            tokio::time::sleep(Duration::from_millis(SEND_DURING_REFRESH_MS)).await;
+            tokio::time::timeout(Duration::from_secs(600), get("{bar}during-refresh")).await
+        });
+
+        assert!(
+            matches!(&result, Ok(Ok(value)) if value == "value"),
+            "GET sent during the first slot refresh did not complete; \
+             Err(Elapsed) means the cluster connection deadlocked: {result:?}"
+        );
+    }
+
+    #[test]
     fn test_async_cluster_reset_routing_if_redirect_fails() {
         let name = "test_async_cluster_reset_routing_if_redirect_fails";
         let completed = Arc::new(AtomicI32::new(0));

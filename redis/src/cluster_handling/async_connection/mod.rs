@@ -541,7 +541,7 @@ static LAST_PENDING_POLL_LOG_MS: std::sync::atomic::AtomicU64 =
 
 /// Logs at most once a second that poll_recover polled a refresh that is still pending:
 /// if these lines stop while a refresh is outstanding, the refresh is no longer being polled.
-fn trace_pending_refresh_poll() {
+fn trace_pending_refresh_poll<T>(conn_lock: &RwLock<T>) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -557,7 +557,15 @@ fn trace_pending_refresh_poll() {
             )
             .is_ok()
     {
-        debug!("refresh-trace: poll_recover polled a refresh that is still pending");
+        // try_write/try_read skip both the waiter queue and tokio's coop budget, so they show
+        // whether the permits are really taken while the refresh's write() keeps waiting.
+        let write_free = conn_lock.try_write().is_ok();
+        let read_free = conn_lock.try_read().is_ok();
+        debug!(
+            "refresh-trace: poll_recover polled a refresh that is still pending; try_write={} try_read={}",
+            if write_free { "ok" } else { "busy" },
+            if read_free { "ok" } else { "busy" }
+        );
     }
 }
 
@@ -1602,7 +1610,7 @@ where
             RecoverFuture::RecoverSlots(future) => match ready!({
                 let poll = future.as_mut().poll(cx);
                 if poll.is_pending() {
-                    trace_pending_refresh_poll();
+                    trace_pending_refresh_poll(&self.inner.conn_lock);
                 }
                 poll
             }) {

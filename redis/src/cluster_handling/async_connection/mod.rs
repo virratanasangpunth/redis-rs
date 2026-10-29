@@ -103,6 +103,7 @@ use std::{
 };
 
 mod addressed_push_sender;
+mod lock_trace;
 mod request;
 mod routing;
 use crate::{
@@ -534,6 +535,32 @@ fn mark_reconnecting<C>(connections: &mut ConnectionMap<C>, addr: NodeAddress) {
         .or_insert(ConnState::Connecting);
 }
 
+static REFRESH_TRACE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_PENDING_POLL_LOG_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Logs at most once a second that poll_recover polled a refresh that is still pending:
+/// if these lines stop while a refresh is outstanding, the refresh is no longer being polled.
+fn trace_pending_refresh_poll() {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let last = LAST_PENDING_POLL_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if now_ms.saturating_sub(last) >= 1000
+        && LAST_PENDING_POLL_LOG_MS
+            .compare_exchange(
+                last,
+                now_ms,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+    {
+        debug!("refresh-trace: poll_recover polled a refresh that is still pending");
+    }
+}
+
 /// This is the internal representation of an async Redis Cluster connection. It stores the
 /// underlying connections maintained for each node in the cluster, as well
 /// as common parameters for connecting to nodes and executing commands.
@@ -569,7 +596,7 @@ where
         routing: &'a MultipleNodeRoutingInfo,
         response_policy: Option<ResponsePolicy>,
     ) -> OperationResult {
-        let read_guard = self.conn_lock.read().await;
+        let read_guard = lock_trace::read(&self.conn_lock, "execute_on_multiple_nodes").await;
         if read_guard.0.is_empty() {
             return (
                 OperationTarget::FanOut,
@@ -905,7 +932,7 @@ where
     ) -> RedisResult<(NodeAddress, C)> {
         let route = match route {
             InternalSingleNodeRouting::Random => {
-                let read_guard = self.conn_lock.read().await;
+                let read_guard = lock_trace::read(&self.conn_lock, "get_connection:random").await;
                 return match get_random_connection(&read_guard.0) {
                     Some((addr, conn)) => Ok((addr, conn)),
                     None => {
@@ -922,7 +949,7 @@ where
                 return self.get_redirected_connection(redirect).await;
             }
             InternalSingleNodeRouting::ByAddress(address) => {
-                let read_guard = self.conn_lock.read().await;
+                let read_guard = lock_trace::read(&self.conn_lock, "get_connection:by_address").await;
                 return match read_guard.0.get(&address).and_then(ConnState::connected) {
                     Some(conn) => Ok((address, conn)),
                     None => Err((
@@ -935,7 +962,7 @@ where
             }
         };
 
-        let read_guard = self.conn_lock.read().await;
+        let read_guard = lock_trace::read(&self.conn_lock, "get_connection:slot").await;
         let preferred = read_guard
             .1
             .slot_addr_for_route(route, self.routing_strategy.as_deref())
@@ -965,7 +992,7 @@ where
             return Ok(found);
         }
 
-        let read_guard = self.conn_lock.read().await;
+        let read_guard = lock_trace::read(&self.conn_lock, "get_connection:random_fallback").await;
         if let Some((random_addr, random_conn)) = get_random_connection(&read_guard.0) {
             drop(read_guard);
             return Ok((random_addr, random_conn));
@@ -979,7 +1006,7 @@ where
         let addr = match redirect {
             Redirect::Moved(addr) | Redirect::Ask(addr) => addr,
         };
-        let read_guard = self.conn_lock.read().await;
+        let read_guard = lock_trace::read(&self.conn_lock, "get_redirected_connection").await;
         let conn = read_guard.0.get(&addr).and_then(ConnState::connected);
         drop(read_guard);
         let mut conn = match conn {
@@ -999,8 +1026,7 @@ where
 
     async fn connect_check_and_add(&self, addr: &NodeAddress) -> RedisResult<C> {
         let conn = connect_and_check::<C>(addr, &self.cluster_params, &self.push_sender).await?;
-        self.conn_lock
-            .write()
+        lock_trace::write(&self.conn_lock, "connect_check_and_add")
             .await
             .0
             .insert(addr.clone(), ConnState::Connected(conn.clone()));
@@ -1020,8 +1046,25 @@ where
 
     // Query a node to discover slot-> master mappings.
     async fn refresh_slots(self) -> RedisResult<()> {
-        let mut write_guard = self.conn_lock.write().await;
-        let (connections, slots) = &mut *write_guard;
+        let seq = REFRESH_TRACE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        debug!("refresh-trace #{seq}: entered, waiting for conn_lock.write()");
+        let lock_wait = std::time::Instant::now();
+        let mut write_guard = lock_trace::write(&self.conn_lock, "refresh_slots").await;
+        debug!(
+            "refresh-trace #{seq}: conn_lock.write() acquired after {} ms",
+            lock_wait.elapsed().as_millis()
+        );
+        let result = self.refresh_slots_locked(seq, &mut write_guard).await;
+        debug!("refresh-trace #{seq}: returning {:?}", result.as_ref().map(|_| ()));
+        result
+    }
+
+    async fn refresh_slots_locked(
+        &self,
+        seq: u64,
+        write_guard: &mut (ConnectionMap<C>, SlotMap),
+    ) -> RedisResult<()> {
+        let (connections, slots) = write_guard;
 
         let mut found = false;
         let mut last_err = None;
@@ -1031,7 +1074,15 @@ where
             let ConnState::Connected(conn) = state else {
                 continue;
             };
-            match Self::query_slots(conn, addr, slots).await {
+            let started = std::time::Instant::now();
+            debug!("refresh-trace #{seq}: pass 1 query_slots {addr:?} start");
+            let result = Self::query_slots(conn, addr, slots).await;
+            debug!(
+                "refresh-trace #{seq}: pass 1 query_slots {addr:?} done after {} ms: {:?}",
+                started.elapsed().as_millis(),
+                result.as_ref().map(|_| ())
+            );
+            match result {
                 Ok(()) => {
                     found = true;
                     break;
@@ -1044,9 +1095,19 @@ where
         // We include Connected connections in this pass, in addition to the first pass above,
         // so that we can do inline connection repairs, if needed (via `get_or_create_conn`).
         if !found {
+            debug!("refresh-trace #{seq}: pass 1 found nothing, starting pass 2");
             for (addr, state) in &mut *connections {
                 let prev = std::mem::replace(state, ConnState::Connecting).into_conn();
-                match get_or_create_conn(addr, prev, &self.cluster_params, &self.push_sender).await
+                let started = std::time::Instant::now();
+                debug!("refresh-trace #{seq}: pass 2 get_or_create_conn {addr:?} start");
+                let created =
+                    get_or_create_conn(addr, prev, &self.cluster_params, &self.push_sender).await;
+                debug!(
+                    "refresh-trace #{seq}: pass 2 get_or_create_conn {addr:?} done after {} ms: {:?}",
+                    started.elapsed().as_millis(),
+                    created.as_ref().map(|_| ())
+                );
+                match created
                 {
                     Ok(mut conn) => {
                         let res = Self::query_slots(&mut conn, addr, slots).await;
@@ -1078,13 +1139,20 @@ where
 
         connections.retain(|addr, _| nodes.contains(addr));
 
-        self.refresh_connections_locked(connections, nodes).await;
+        debug!(
+            "refresh-trace #{seq}: refresh_connections_locked start ({} nodes)",
+            nodes.len()
+        );
+        self.refresh_connections_locked(seq, connections, nodes)
+            .await;
+        debug!("refresh-trace #{seq}: refresh_connections_locked done");
 
         Ok(())
     }
 
     async fn refresh_connections_locked(
         &self,
+        seq: u64,
         connections: &mut ConnectionMap<C>,
         nodes: HashSet<NodeAddress>,
     ) {
@@ -1094,6 +1162,8 @@ where
             .map(|addr| {
                 let connection = connections.remove(&addr).and_then(ConnState::into_conn);
                 async move {
+                    let started = std::time::Instant::now();
+                    debug!("refresh-trace #{seq}: node {addr:?} get_or_create_conn start");
                     let res = get_or_create_conn(
                         &addr,
                         connection,
@@ -1101,6 +1171,11 @@ where
                         &self.push_sender,
                     )
                     .await;
+                    debug!(
+                        "refresh-trace #{seq}: node {addr:?} get_or_create_conn done after {} ms: {:?}",
+                        started.elapsed().as_millis(),
+                        res.as_ref().map(|_| ())
+                    );
                     (addr, res)
                 }
             })
@@ -1233,7 +1308,7 @@ where
     C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
 {
     {
-        let mut guard = core.conn_lock.write().await;
+        let mut guard = lock_trace::write(&core.conn_lock, "reconnect_loop:mark").await;
 
         if matches!(
             guard.0.get(&addr),
@@ -1253,11 +1328,11 @@ where
             .max_connection_attempts
             .is_some_and(|max| max.get() < attempts)
         {
-            core.conn_lock.write().await.0.remove(&addr);
+            lock_trace::write(&core.conn_lock, "reconnect_loop:max_attempts").await.0.remove(&addr);
             break;
         }
         let prev = {
-            let guard = core.conn_lock.read().await;
+            let guard = lock_trace::read(&core.conn_lock, "reconnect_loop:check").await;
             let in_topology = guard.1.addresses_for_all_nodes().contains(&addr);
             let entry = guard.0.get(&addr);
             if matches!(entry, Some(ConnState::Connected(_))) {
@@ -1267,7 +1342,7 @@ where
             drop(guard);
 
             if !in_topology {
-                core.conn_lock.write().await.0.remove(&addr);
+                lock_trace::write(&core.conn_lock, "reconnect_loop:not_in_topology").await.0.remove(&addr);
 
                 break;
             }
@@ -1277,7 +1352,7 @@ where
         match get_or_create_conn(&addr, prev, &core.cluster_params, &core.push_sender).await {
             Ok(conn) => {
                 let newly_installed = {
-                    let mut guard = core.conn_lock.write().await;
+                    let mut guard = lock_trace::write(&core.conn_lock, "reconnect_loop:install").await;
 
                     if matches!(guard.0.get(&addr), Some(ConnState::Connected(_))) {
                         false
@@ -1471,7 +1546,7 @@ where
                 &inner.push_sender,
             )
             .await?;
-            *inner.conn_lock.write().await = (connection_map, SlotMap::new());
+            *lock_trace::write(&inner.conn_lock, "reconnect_to_initial_nodes").await = (connection_map, SlotMap::new());
             inner.refresh_slots().await?;
             Ok(())
         }
@@ -1521,7 +1596,13 @@ where
             ConnectionState::Recover(future) => future,
         };
         let res = match recover_future {
-            RecoverFuture::RecoverSlots(future) => match ready!(future.as_mut().poll(cx)) {
+            RecoverFuture::RecoverSlots(future) => match ready!({
+                let poll = future.as_mut().poll(cx);
+                if poll.is_pending() {
+                    trace_pending_refresh_poll();
+                }
+                poll
+            }) {
                 Ok(_) => {
                     info!("async cluster client recovery: slot refresh complete");
                     self.state = ConnectionState::PollComplete;

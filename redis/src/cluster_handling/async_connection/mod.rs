@@ -1568,13 +1568,16 @@ where
             {
                 continue;
             }
+            debug!("refresh-trace: registering reconnect_loop for {addr:?}");
             self.reconnect_futures
                 .push(Box::pin(reconnect_loop(self.inner.clone(), addr)));
         }
     }
 
     fn poll_reconnects(&mut self, cx: &mut task::Context<'_>) {
-        while let Poll::Ready(Some(_)) = Pin::new(&mut self.reconnect_futures).poll_next(cx) {}
+        while let Poll::Ready(Some(addr)) = Pin::new(&mut self.reconnect_futures).poll_next(cx) {
+            debug!("refresh-trace: reconnect_loop for {addr:?} finished");
+        }
     }
 
     async fn wait_for_initial_connection(&mut self) -> RedisResult<()> {
@@ -1707,6 +1710,13 @@ where
 
         if !matches!(poll_flush_action, PollFlushAction::None) || self.in_flight_requests.is_empty()
         {
+            if !matches!(poll_flush_action, PollFlushAction::None) {
+                debug!(
+                    "refresh-trace: poll_in_flight -> {:?} ({} requests still in flight)",
+                    poll_flush_action,
+                    self.in_flight_requests.len()
+                );
+            }
             Poll::Ready(poll_flush_action)
         } else {
             Poll::Pending

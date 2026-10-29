@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, Once};
 use std::time::{Duration, Instant};
 
-use log::warn;
+use log::{debug, warn};
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const STUCK_AFTER: Duration = Duration::from_secs(2);
@@ -73,7 +73,21 @@ impl Drop for Registration {
 
 pub(super) struct Traced<G> {
     guard: G,
+    /// Set for writes only: the site, the registration id and when it was acquired, so the
+    /// release can be logged with its hold time.
+    write_release: Option<(&'static str, u64, Instant)>,
     _registration: Registration,
+}
+
+impl<G> Drop for Traced<G> {
+    fn drop(&mut self) {
+        if let Some((site, id, acquired)) = self.write_release {
+            debug!(
+                "lock-trace: write #{id} {site} released after holding {} ms",
+                acquired.elapsed().as_millis()
+            );
+        }
+    }
 }
 
 impl<G: Deref> Deref for Traced<G> {
@@ -98,6 +112,7 @@ pub(super) async fn read<'a, T>(
     registration.held();
     Traced {
         guard,
+        write_release: None,
         _registration: registration,
     }
 }
@@ -107,10 +122,18 @@ pub(super) async fn write<'a, T>(
     site: &'static str,
 ) -> Traced<RwLockWriteGuard<'a, T>> {
     let registration = Registration::new(site, "write");
+    let id = registration.0;
+    let requested = Instant::now();
+    debug!("lock-trace: write #{id} {site} requested");
     let guard = lock.write().await;
     registration.held();
+    debug!(
+        "lock-trace: write #{id} {site} acquired after waiting {} ms",
+        requested.elapsed().as_millis()
+    );
     Traced {
         guard,
+        write_release: Some((site, id, Instant::now())),
         _registration: registration,
     }
 }
